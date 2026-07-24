@@ -9,14 +9,17 @@ Run with:  streamlit run MovieIQ.py
 """
 
 import ast
-import json
-import pickle
 
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 import seaborn as sns
 import streamlit as st
+from scipy import stats as sci_stats
+from sklearn.ensemble import RandomForestClassifier
+from sklearn.metrics import accuracy_score, confusion_matrix, precision_score, recall_score
+from sklearn.model_selection import train_test_split
+from sklearn.preprocessing import MultiLabelBinarizer
 
 sns.set_style("whitegrid")
 
@@ -25,41 +28,101 @@ sns.set_style("whitegrid")
 # ---------------------------------------------------------------------------
 st.set_page_config(page_title="MovieIQ", page_icon="🎬", layout="wide")
 
+# ---------------------------------------------------------------------------
+# Self-contained pipeline: this app only requires movies.csv on disk.
+# Everything else (cleaning, stats tests, model training) is computed here
+# and cached, so there is nothing extra to commit or keep in sync.
+# ---------------------------------------------------------------------------
+ALPHA = 0.05
 
-# ---------------------------------------------------------------------------
-# Cached loaders
-# ---------------------------------------------------------------------------
+
+def parse_genres(raw):
+    try:
+        parsed = ast.literal_eval(raw)
+        return [g["name"] for g in parsed]
+    except (ValueError, SyntaxError, TypeError):
+        return []
+
+
 @st.cache_data
 def load_data():
-    df = pd.read_csv("movies_clean.csv")
-    df["genre_list"] = df["genre_list"].apply(ast.literal_eval)
+    df = pd.read_csv("movies.csv")
+    df = df[(df["budget"] > 0) & (df["revenue"] > 0)].copy()
+    df["success"] = (df["revenue"] > df["budget"]).astype(int)
+    df["genre_list"] = df["genres"].apply(parse_genres)
+    df["primary_genre"] = df["genre_list"].apply(lambda g: g[0] if g else "Unknown")
     return df
 
 
 @st.cache_data
-def load_results():
-    with open("results.json") as f:
-        return json.load(f)
+def compute_results(df):
+    """Recreate the same statistics analysis.py computes, for display in the app."""
+    results = {}
 
+    # Stage 2 — EDA numbers
+    results["budget_revenue_correlation"] = round(float(df["budget"].corr(df["revenue"])), 4)
 
-def load_pickle(path):
-    with open(path, "rb") as f:
-        return pickle.load(f)
+    # Stage 3 — statistical tests
+    success_votes = df.loc[df["success"] == 1, "vote_average"]
+    fail_votes = df.loc[df["success"] == 0, "vote_average"]
+    t_stat, t_p = sci_stats.ttest_ind(success_votes, fail_votes, equal_var=False)
+    results["ttest"] = {
+        "t_statistic": round(float(t_stat), 4),
+        "p_value": round(float(t_p), 6),
+        "significant": bool(t_p < ALPHA),
+        "mean_success": round(float(success_votes.mean()), 3),
+        "mean_failure": round(float(fail_votes.mean()), 3),
+    }
+
+    contingency = pd.crosstab(df["primary_genre"], df["success"])
+    chi2, chi_p, dof, _ = sci_stats.chi2_contingency(contingency)
+    results["chi_square"] = {
+        "chi2_statistic": round(float(chi2), 4),
+        "p_value": round(float(chi_p), 6),
+        "degrees_of_freedom": int(dof),
+        "significant": bool(chi_p < ALPHA),
+    }
+    return results
 
 
 @st.cache_resource
-def load_model_artifacts():
-    model = load_pickle("model/random_forest.pkl")
-    mlb = load_pickle("model/genre_encoder.pkl")
-    feature_cols_base = load_pickle("model/feature_cols_base.pkl")
-    all_feature_columns = load_pickle("model/all_feature_columns.pkl")
-    genre_classes = load_pickle("model/genre_classes.pkl")
-    return model, mlb, feature_cols_base, all_feature_columns, genre_classes
+def train_model(df):
+    """Train the Random Forest once per app session and cache it."""
+    mlb = MultiLabelBinarizer()
+    genre_dummies = pd.DataFrame(
+        mlb.fit_transform(df["genre_list"]), columns=[f"genre_{g}" for g in mlb.classes_], index=df.index
+    )
+    feature_cols_base = ["budget", "popularity", "runtime", "vote_average"]
+    X = pd.concat([df[feature_cols_base], genre_dummies], axis=1)
+    y = df["success"]
+
+    X_train, X_test, y_train, y_test = train_test_split(
+        X, y, test_size=0.2, random_state=42, stratify=y
+    )
+    model = RandomForestClassifier(n_estimators=300, max_depth=8, random_state=42, class_weight="balanced")
+    model.fit(X_train, y_train)
+
+    y_pred = model.predict(X_test)
+    metrics = {
+        "accuracy": round(float(accuracy_score(y_test, y_pred)), 4),
+        "precision": round(float(precision_score(y_test, y_pred)), 4),
+        "recall": round(float(recall_score(y_test, y_pred)), 4),
+        "confusion_matrix": confusion_matrix(y_test, y_pred).tolist(),
+        "train_size": len(X_train),
+        "test_size": len(X_test),
+        "split_ratio": "80/20",
+    }
+    importances = pd.Series(model.feature_importances_, index=X.columns).sort_values(ascending=False)
+    metrics["feature_importance"] = importances.round(4).to_dict()
+
+    genre_classes = sorted(mlb.classes_)
+    all_feature_columns = list(X.columns)
+    return model, mlb, feature_cols_base, all_feature_columns, genre_classes, metrics
 
 
 df = load_data()
-results = load_results()
-model, mlb, feature_cols_base, all_feature_columns, genre_classes = load_model_artifacts()
+results = compute_results(df)
+model, mlb, feature_cols_base, all_feature_columns, genre_classes, model_metrics = train_model(df)
 
 all_genres = sorted(df["genre_list"].explode().dropna().unique())
 
@@ -126,7 +189,7 @@ with tab_eda:
     st.pyplot(fig)
     st.caption(
         f"Correlation between budget and revenue across the full dataset: "
-        f"**{results['stage2']['budget_revenue_correlation']:.2f}** — bigger budgets "
+        f"**{results['budget_revenue_correlation']:.2f}** — bigger budgets "
         f"loosely track bigger revenues, but the relationship is far from perfect."
     )
 
@@ -169,13 +232,13 @@ with tab_eda:
 # ---------------------------------------------------------------------------
 with tab_stats:
     st.subheader("T-Test — vote_average by Success")
-    ttest = results["stage3"]["ttest"]
+    ttest = results["ttest"]
     c1, c2, c3 = st.columns(3)
     c1.metric("t-statistic", ttest["t_statistic"])
     c2.metric("p-value", ttest["p_value"])
     c3.metric("Significant (α=0.05)?", "Yes" if ttest["significant"] else "No")
     st.write(
-        f"**Null hypothesis:** {ttest['null_hypothesis']}\n\n"
+        f"**Null hypothesis:** The mean vote_average is the same for successful and unsuccessful movies.\n\n"
         f"Mean vote_average — successful movies: **{ttest['mean_success']}**, "
         f"unsuccessful movies: **{ttest['mean_failure']}**.\n\n"
         f"Since p = {ttest['p_value']} {'<' if ttest['significant'] else '≥'} 0.05, we "
@@ -186,13 +249,13 @@ with tab_stats:
 
     st.markdown("---")
     st.subheader("Chi-Square Test — Genre vs. Success")
-    chi = results["stage3"]["chi_square"]
+    chi = results["chi_square"]
     c1, c2, c3 = st.columns(3)
     c1.metric("χ² statistic", chi["chi2_statistic"])
     c2.metric("p-value", chi["p_value"])
     c3.metric("Significant (α=0.05)?", "Yes" if chi["significant"] else "No")
     st.write(
-        f"**Null hypothesis:** {chi['null_hypothesis']}\n\n"
+        f"**Null hypothesis:** Genre and movie success are independent of each other.\n\n"
         f"With p = {chi['p_value']} {'<' if chi['significant'] else '≥'} 0.05 "
         f"(dof = {chi['degrees_of_freedom']}), we "
         f"{'reject' if chi['significant'] else 'fail to reject'} the null hypothesis: genre "
@@ -212,7 +275,7 @@ with tab_stats:
 # TAB 3 — Model Performance (Stage 4/5.2)
 # ---------------------------------------------------------------------------
 with tab_model:
-    s4 = results["stage4"]
+    s4 = model_metrics
     st.subheader("Random Forest Classifier")
     st.caption(
         f"Trained on a {s4['split_ratio']} train/test split "
@@ -287,7 +350,7 @@ with st.expander("📝 Reflection"):
     st.write(
         "If a studio asked *'Will our next film succeed?'*, MovieIQ's answer should be treated "
         "as **one useful signal, not a verdict**. In this dataset the model reaches "
-        f"**{results['stage4']['accuracy']:.0%} accuracy**, and the statistical tests found "
+        f"**{model_metrics['accuracy']:.0%} accuracy**, and the statistical tests found "
         "**no significant relationship** between genre or audience rating and success once "
         "revenue-vs-budget is the yardstick — the strongest real signal is simply how much a "
         "movie cost to make relative to how popular and well-reviewed it eventually became. "
