@@ -10,8 +10,8 @@ Run with:  streamlit run MovieIQ.py
 
 import ast
 import json
+import pickle
 
-import joblib
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
@@ -42,13 +42,18 @@ def load_results():
         return json.load(f)
 
 
+def load_pickle(path):
+    with open(path, "rb") as f:
+        return pickle.load(f)
+
+
 @st.cache_resource
 def load_model_artifacts():
-    model = joblib.load("model/random_forest.joblib")
-    mlb = joblib.load("model/genre_encoder.joblib")
-    feature_cols_base = joblib.load("model/feature_cols_base.joblib")
-    all_feature_columns = joblib.load("model/all_feature_columns.joblib")
-    genre_classes = joblib.load("model/genre_classes.joblib")
+    model = load_pickle("model/random_forest.pkl")
+    mlb = load_pickle("model/genre_encoder.pkl")
+    feature_cols_base = load_pickle("model/feature_cols_base.pkl")
+    all_feature_columns = load_pickle("model/all_feature_columns.pkl")
+    genre_classes = load_pickle("model/genre_classes.pkl")
     return model, mlb, feature_cols_base, all_feature_columns, genre_classes
 
 
